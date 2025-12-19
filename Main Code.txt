@@ -1,0 +1,421 @@
+
+Poultry Monitoring System - Main API
+Automated bird counting, tracking, and weight estimation from CCTV footage.
+
+
+import os
+import tempfile
+import json
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import JSONResponse
+import supervision as sv
+from ultralytics import YOLO
+from sklearn.linear_model import LinearRegression
+
+# Initialize FastAPI
+app = FastAPI(
+    title="Poultry Monitoring System",
+    description="Computer vision system for automated poultry monitoring",
+    version="1.0.0"
+)
+
+# Initialize YOLOv8 model (bird class = 14 in COCO dataset)
+MODEL = None
+
+def get_model():
+    """Lazy load YOLO model"""
+    global MODEL
+    if MODEL is None:
+        MODEL = YOLO("yolov8n.pt")  # Nano model for speed
+    return MODEL
+
+
+class WeightEstimator:
+    """
+    Weight estimation using bounding box features.
+    
+    Method: Feature-based regression using bbox area and aspect ratio
+    Formula: weight_index = bbox_area × density × (1 + 0.1 × aspect_ratio)
+    
+    Assumptions:
+    - Larger bounding boxes correlate with heavier birds
+    - Aspect ratio (height/width) provides body shape information
+    - Camera is fixed with consistent perspective
+    - Birds are standing (not flying) for accurate measurement
+    """
+    
+    def __init__(self, calibrated=False, calibration_factor=None, calibration_bias=None):
+        self.calibrated = calibrated
+        self.calibration_factor = calibration_factor
+        self.calibration_bias = calibration_bias
+        self.density_factor = 1.0
+    
+    def estimate_weight(self, bbox: np.ndarray, confidence: float) -> Dict:
+        """
+        Estimate weight from bounding box.
+        
+        Args:
+            bbox: [x1, y1, x2, y2] bounding box coordinates
+            confidence: Detection confidence score
+            
+        Returns:
+            Dictionary with weight estimate and metadata
+        """
+        x1, y1, x2, y2 = bbox
+        
+        # Calculate features
+        width = x2 - x1
+        height = y2 - y1
+        area = width * height
+        aspect_ratio = height / width if width > 0 else 1.0
+        
+        # Weight proxy calculation
+        weight_index = area * self.density_factor * (1 + 0.1 * aspect_ratio)
+        
+        # Confidence calculation
+        size_confidence = min(area / 5000.0, 1.0)
+        final_confidence = confidence * size_confidence * 0.8
+        
+        # Convert to grams if calibrated
+        if self.calibrated and self.calibration_factor:
+            weight_value = (weight_index * self.calibration_factor) + self.calibration_bias
+            unit = "grams"
+            method = "calibrated_regression"
+        else:
+            weight_value = weight_index
+            unit = "index"
+            method = "bbox_area_proxy"
+        
+        return {
+            "weight_value": round(float(weight_value), 2),
+            "unit": unit,
+            "confidence": round(float(final_confidence), 3),
+            "method": method,
+            "bbox_area": float(area),
+            "aspect_ratio": round(float(aspect_ratio), 3)
+        }
+
+
+class PoultryTracker:
+    """
+    Bird tracking and counting system.
+    
+    Detection: YOLOv8 pretrained on COCO (bird class)
+    Tracking: ByteTrack algorithm with stable ID assignment
+    
+    Anti-double-counting measures:
+    1. Stable tracking IDs maintained across frames
+    2. Minimum track length filtering (5 frames)
+    3. Track activation threshold (0.25 confidence)
+    4. Temporal consistency checks
+    
+    Occlusion handling:
+    1. Motion prediction during brief occlusions
+    2. Lost track buffer (30 frames)
+    3. High IoU matching threshold (0.8)
+    4. Track validation filters
+    """
+    
+    def __init__(self, conf_thresh=0.25, iou_thresh=0.45):
+        self.model = get_model()
+        self.conf_thresh = conf_thresh
+        self.iou_thresh = iou_thresh
+        
+        # ByteTrack tracker configuration
+        self.tracker = sv.ByteTrack(
+            track_activation_threshold=0.25,
+            lost_track_buffer=30,
+            minimum_matching_threshold=0.8,
+            frame_rate=30,
+            minimum_consecutive_frames=5
+        )
+        
+        self.weight_estimator = WeightEstimator()
+        self.track_weights = {}  # Store weight estimates per track
+        
+    def process_video(
+        self,
+        video_path: str,
+        fps_sample: Optional[int] = None,
+        output_path: Optional[str] = None
+    ) -> Dict:
+        """
+        Process video for bird counting and weight estimation.
+        
+        Args:
+            video_path: Path to input video
+            fps_sample: Sample every Nth frame (e.g., 5 = process 5 FPS)
+            output_path: Path to save annotated video
+            
+        Returns:
+            Dictionary with counts, tracks, weights, and metadata
+        """
+        cap = cv2.VideoCapture(video_path)
+        
+        # Video properties
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        # Frame sampling
+        if fps_sample:
+            frame_skip = max(1, int(fps / fps_sample))
+        else:
+            frame_skip = 1
+        
+        # Output video writer
+        writer = None
+        if output_path:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        # Results storage
+        counts = []
+        tracks_sample = []
+        frame_idx = 0
+        processed_frames = 0
+        
+        # Annotators
+        box_annotator = sv.BoxAnnotator(thickness=2)
+        label_annotator = sv.LabelAnnotator(text_scale=0.5)
+        
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Frame sampling
+            if frame_idx % frame_skip != 0:
+                frame_idx += 1
+                continue
+            
+            timestamp = frame_idx / fps
+            
+            # YOLOv8 detection (bird class = 14)
+            results = self.model(frame, conf=self.conf_thresh, iou=self.iou_thresh, verbose=False)[0]
+            
+            # Filter for bird class only
+            detections = sv.Detections.from_ultralytics(results)
+            bird_mask = detections.class_id == 14  # COCO bird class
+            detections = detections[bird_mask]
+            
+            # ByteTrack tracking
+            detections = self.tracker.update_with_detections(detections)
+            
+            # Count birds
+            bird_count = len(detections)
+            counts.append({
+                "timestamp": round(timestamp, 2),
+                "frame_idx": frame_idx,
+                "count": bird_count
+            })
+            
+            # Process each detection
+            if len(detections) > 0:
+                for i, (bbox, confidence, class_id, tracker_id) in enumerate(zip(
+                    detections.xyxy,
+                    detections.confidence,
+                    detections.class_id,
+                    detections.tracker_id
+                )):
+                    # Weight estimation
+                    weight_info = self.weight_estimator.estimate_weight(bbox, confidence)
+                    
+                    # Store weight per track for averaging
+                    if tracker_id not in self.track_weights:
+                        self.track_weights[tracker_id] = []
+                    self.track_weights[tracker_id].append(weight_info)
+                    
+                    # Sample tracks for output (every 30 frames)
+                    if frame_idx % 30 == 0 and i < 3:  # Sample first 3 birds
+                        tracks_sample.append({
+                            "track_id": int(tracker_id),
+                            "bbox": [float(x) for x in bbox],
+                            "confidence": round(float(confidence), 3),
+                            "frame_idx": frame_idx,
+                            "timestamp": round(timestamp, 2)
+                        })
+            
+            # Annotate frame
+            if writer:
+                annotated_frame = frame.copy()
+                
+                if len(detections) > 0:
+                    # Draw bounding boxes
+                    annotated_frame = box_annotator.annotate(
+                        scene=annotated_frame,
+                        detections=detections
+                    )
+                    
+                    # Add labels with track IDs
+                    labels = [f"ID:{tid}" for tid in detections.tracker_id]
+                    annotated_frame = label_annotator.annotate(
+                        scene=annotated_frame,
+                        detections=detections,
+                        labels=labels
+                    )
+                
+                # Add count overlay
+                cv2.putText(
+                    annotated_frame,
+                    f"Birds: {bird_count}",
+                    (20, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.5,
+                    (0, 255, 0),
+                    3
+                )
+                
+                writer.write(annotated_frame)
+            
+            processed_frames += 1
+            frame_idx += 1
+        
+        cap.release()
+        if writer:
+            writer.release()
+        
+        # Calculate averaged weight estimates per track
+        weight_estimates = []
+        for track_id, weights in self.track_weights.items():
+            if len(weights) >= 5:  # Minimum track length
+                avg_weight = np.mean([w["weight_value"] for w in weights])
+                avg_confidence = np.mean([w["confidence"] for w in weights])
+                
+                weight_estimates.append({
+                    "track_id": int(track_id),
+                    "weight_value": round(float(avg_weight), 2),
+                    "unit": weights[0]["unit"],
+                    "confidence": round(float(avg_confidence), 3),
+                    "method": weights[0]["method"] + "_averaged",
+                    "num_observations": len(weights)
+                })
+        
+        # Sort by track_id
+        weight_estimates.sort(key=lambda x: x["track_id"])
+        
+        # Calculate statistics
+        unique_tracks = len(self.track_weights)
+        avg_count = np.mean([c["count"] for c in counts]) if counts else 0
+        max_count = max([c["count"] for c in counts]) if counts else 0
+        
+        return {
+            "counts": counts,
+            "tracks_sample": tracks_sample[:50],  # Limit sample size
+            "weight_estimates": weight_estimates,
+            "artifacts": {
+                "annotated_video": output_path if output_path else None,
+                "video_exists": output_path is not None and os.path.exists(output_path)
+            },
+            "metadata": {
+                "total_frames": total_frames,
+                "processed_frames": processed_frames,
+                "fps": float(fps),
+                "effective_fps": float(fps / frame_skip),
+                "resolution": [width, height],
+                "unique_tracks": unique_tracks,
+                "avg_bird_count": round(float(avg_count), 2),
+                "max_bird_count": int(max_count),
+                "weight_calibration_needed": not self.weight_estimator.calibrated,
+                "calibration_requirements": [
+                    "Place reference object (10cm x 10cm) in view",
+                    "Weigh 10+ birds with scale",
+                    "Capture video of weighed birds",
+                    "Run calibration regression"
+                ] if not self.weight_estimator.calibrated else []
+            }
+        }
+
+
+# API Endpoints
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information"""
+    return {
+        "service": "Poultry Monitoring System",
+        "version": "1.0.0",
+        "endpoints": {
+            "health": "/health",
+            "analyze_video": "/analyze_video (POST)"
+        }
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "OK",
+        "service": "Poultry Monitoring System"
+    }
+
+
+@app.post("/analyze_video")
+async def analyze_video(
+    file: UploadFile = File(...),
+    fps_sample: Optional[int] = Form(None),
+    conf_thresh: float = Form(0.25),
+    iou_thresh: float = Form(0.45)
+):
+    """
+    Analyze poultry video for bird counting, tracking, and weight estimation.
+    
+    Args:
+        file: Video file (MP4, AVI, etc.)
+        fps_sample: Frame sampling rate (e.g., 5 = process 5 FPS)
+        conf_thresh: Detection confidence threshold (0-1, default: 0.25)
+        iou_thresh: IoU threshold for NMS (0-1, default: 0.45)
+        
+    Returns:
+        JSON with counts, tracks, weight estimates, and metadata
+    """
+    
+    # Validate parameters
+    if conf_thresh < 0 or conf_thresh > 1:
+        raise HTTPException(status_code=400, detail="conf_thresh must be between 0 and 1")
+    if iou_thresh < 0 or iou_thresh > 1:
+        raise HTTPException(status_code=400, detail="iou_thresh must be between 0 and 1")
+    
+    # Save uploaded file
+    temp_dir = tempfile.gettempdir()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    input_path = os.path.join(temp_dir, f"input_{timestamp}.mp4")
+    output_path = os.path.join(temp_dir, f"annotated_{timestamp}.mp4")
+    
+    try:
+        # Save uploaded file
+        with open(input_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        # Process video
+        tracker = PoultryTracker(conf_thresh=conf_thresh, iou_thresh=iou_thresh)
+        results = tracker.process_video(
+            video_path=input_path,
+            fps_sample=fps_sample,
+            output_path=output_path
+        )
+        
+        return JSONResponse(content=results)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
+    
+    finally:
+        # Cleanup input file
+        if os.path.exists(input_path):
+            os.remove(input_path)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

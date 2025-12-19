@@ -1,0 +1,213 @@
+
+Test client for Poultry Monitoring System API
+
+
+import argparse
+import json
+import os
+import sys
+import requests
+from pathlib import Path
+
+
+def analyze_video(
+    video_path: str,
+    fps_sample: int = 5,
+    conf_thresh: float = 0.25,
+    iou_thresh: float = 0.45,
+    api_url: str = "http://localhost:8000",
+    output_dir: str = "./results"
+):
+    """
+    Send video to API for analysis
+    
+    Args:
+        video_path: Path to video file
+        fps_sample: Frame sampling rate
+        conf_thresh: Detection confidence threshold
+        iou_thresh: IoU threshold
+        api_url: API base URL
+        output_dir: Directory to save results
+    """
+    
+    if not os.path.exists(video_path):
+        print(f"Error: Video file not found: {video_path}")
+        return False
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    print(f"\n{'='*60}")
+    print(f"Poultry Monitoring System - Test Client")
+    print(f"{'='*60}")
+    print(f"Video: {video_path}")
+    print(f"FPS Sample: {fps_sample}")
+    print(f"Confidence Threshold: {conf_thresh}")
+    print(f"IoU Threshold: {iou_thresh}")
+    print(f"API URL: {api_url}")
+    print(f"{'='*60}\n")
+    
+    # Check health
+    print("Checking API health...")
+    try:
+        response = requests.get(f"{api_url}/health")
+        if response.status_code == 200:
+            print("✓ API is healthy")
+        else:
+            print("✗ API health check failed")
+            return False
+    except requests.exceptions.ConnectionError:
+        print("✗ Cannot connect to API. Is the server running?")
+        print("  Start with: uvicorn main:app --reload --host 0.0.0.0 --port 8000")
+        return False
+    
+    # Analyze video
+    print(f"\nAnalyzing video (this may take a few minutes)...")
+    
+    with open(video_path, 'rb') as f:
+        files = {'file': (os.path.basename(video_path), f, 'video/mp4')}
+        data = {
+            'fps_sample': fps_sample,
+            'conf_thresh': conf_thresh,
+            'iou_thresh': iou_thresh
+        }
+        
+        try:
+            response = requests.post(
+                f"{api_url}/analyze_video",
+                files=files,
+                data=data,
+                timeout=600  # 10 minute timeout
+            )
+            
+            if response.status_code == 200:
+                results = response.json()
+                
+                # Save results
+                results_path = os.path.join(output_dir, "results.json")
+                with open(results_path, 'w') as f:
+                    json.dump(results, f, indent=2)
+                
+                # Display summary
+                print(f"\n{'='*60}")
+                print("ANALYSIS COMPLETE")
+                print(f"{'='*60}")
+                
+                metadata = results['metadata']
+                print(f"\nVideo Statistics:")
+                print(f"  Total Frames: {metadata['total_frames']}")
+                print(f"  Processed Frames: {metadata['processed_frames']}")
+                print(f"  FPS: {metadata['fps']}")
+                print(f"  Effective FPS: {metadata['effective_fps']}")
+                print(f"  Resolution: {metadata['resolution'][0]}x{metadata['resolution'][1]}")
+                
+                print(f"\nBird Counting Results:")
+                print(f"  Unique Tracks: {metadata['unique_tracks']}")
+                print(f"  Average Count: {metadata['avg_bird_count']:.2f} birds/frame")
+                print(f"  Max Count: {metadata['max_bird_count']} birds")
+                
+                print(f"\nWeight Estimation:")
+                print(f"  Birds Estimated: {len(results['weight_estimates'])}")
+                if results['weight_estimates']:
+                    avg_weight = sum(w['weight_value'] for w in results['weight_estimates']) / len(results['weight_estimates'])
+                    print(f"  Average Weight: {avg_weight:.2f} {results['weight_estimates'][0]['unit']}")
+                
+                if metadata['weight_calibration_needed']:
+                    print(f"\n⚠️  Calibration Needed:")
+                    print(f"  Current output is 'weight index' (relative measure)")
+                    print(f"  To convert to grams, see README.md calibration section")
+                
+                print(f"\nOutput Files:")
+                print(f"  Results: {results_path}")
+                
+                if results['artifacts']['video_exists']:
+                    print(f"  Annotated Video: {results['artifacts']['annotated_video']}")
+                
+                print(f"\n{'='*60}\n")
+                
+                # Save summary
+                summary_path = os.path.join(output_dir, "summary.txt")
+                with open(summary_path, 'w') as f:
+                    f.write(f"Poultry Monitoring System - Analysis Summary\n")
+                    f.write(f"{'='*60}\n\n")
+                    f.write(f"Video: {video_path}\n")
+                    f.write(f"Unique Tracks: {metadata['unique_tracks']}\n")
+                    f.write(f"Average Count: {metadata['avg_bird_count']:.2f}\n")
+                    f.write(f"Max Count: {metadata['max_bird_count']}\n")
+                    f.write(f"Birds with Weight Estimates: {len(results['weight_estimates'])}\n")
+                
+                print(f"Summary saved to: {summary_path}")
+                
+                return True
+                
+            else:
+                print(f"✗ API returned error: {response.status_code}")
+                print(f"  {response.text}")
+                return False
+                
+        except requests.exceptions.Timeout:
+            print("✗ Request timed out. Video may be too long.")
+            print("  Try increasing fps_sample for faster processing.")
+            return False
+        except Exception as e:
+            print(f"✗ Error: {str(e)}")
+            return False
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Test client for Poultry Monitoring System API"
+    )
+    parser.add_argument(
+        "--video",
+        type=str,
+        required=True,
+        help="Path to video file"
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        default=5,
+        help="Frame sampling rate (default: 5)"
+    )
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.25,
+        help="Detection confidence threshold (default: 0.25)"
+    )
+    parser.add_argument(
+        "--iou",
+        type=float,
+        default=0.45,
+        help="IoU threshold (default: 0.45)"
+    )
+    parser.add_argument(
+        "--api",
+        type=str,
+        default="http://localhost:8000",
+        help="API base URL (default: http://localhost:8000)"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="./results",
+        help="Output directory (default: ./results)"
+    )
+    
+    args = parser.parse_args()
+    
+    success = analyze_video(
+        video_path=args.video,
+        fps_sample=args.fps,
+        conf_thresh=args.conf,
+        iou_thresh=args.iou,
+        api_url=args.api,
+        output_dir=args.output
+    )
+    
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
