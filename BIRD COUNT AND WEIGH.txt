@@ -1,0 +1,114 @@
+!pip install -q ultralytics opencv-python-headless numpy
+
+from ultralytics import YOLO
+import cv2, json, numpy as np
+from collections import defaultdict
+
+VIDEO_PATH = "/content/drive/MyDrive/2025_12_15_15_24_16_4_dQCiGf.MP4"
+OUTPUT_VIDEO = "/content/annotated_output.mp4"
+OUTPUT_JSON = "/content/results.json"
+
+
+model = YOLO("yolov8n.pt")
+
+
+def compute_weight_proxy(area):
+    return round(min(area / 18000, 1.0), 3)
+
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+fps = int(cap.get(cv2.CAP_PROP_FPS))
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+writer = cv2.VideoWriter(
+    OUTPUT_VIDEO,
+    cv2.VideoWriter_fourcc(*"mp4v"),
+    fps,
+    (w, h)
+)
+
+track_history = defaultdict(list)
+count_over_time = []
+frame_id = 0
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    results = model.track(
+        frame,
+        persist=True,
+        conf=0.25,
+        iou=0.5,
+        tracker="bytetrack.yaml",
+        verbose=False
+    )
+
+    bird_ids = set()
+
+    if results[0].boxes.id is not None:
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        ids = results[0].boxes.id.cpu().numpy()
+
+        for box, tid in zip(boxes, ids):
+            x1, y1, x2, y2 = map(int, box)
+            area = (x2 - x1) * (y2 - y1)
+
+            # --------- POULTRY FILTER ---------
+            if area < 2500 or area > 40000:
+                continue
+            if y2 < h * 0.4:  # ignore flying/background
+                continue
+            # ---------------------------------
+
+            weight = compute_weight_proxy(area)
+            bird_ids.add(int(tid))
+            track_history[int(tid)].append(area)
+
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+            cv2.putText(
+                frame,
+                f"ID:{int(tid)} W:{weight}",
+                (x1, y1-5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255,0,0),
+                2
+            )
+
+    count_over_time.append({
+        "time_sec": round(frame_id / fps, 2),
+        "bird_count": len(bird_ids)
+    })
+
+    writer.write(frame)
+    frame_id += 1
+
+cap.release()
+writer.release()
+
+results_json = {
+    "total_unique_birds": len(track_history),
+    "count_over_time": count_over_time,
+    "birds": {
+        str(k): {
+            "avg_area": float(np.mean(v)),
+            "weight_proxy": compute_weight_proxy(np.mean(v))
+        }
+        for k, v in track_history.items()
+    }
+}
+
+with open(OUTPUT_JSON, "w") as f:
+    json.dump(results_json, f, indent=4)
+
+print("✅ DONE")
+print("Annotated video:", OUTPUT_VIDEO)
+print("JSON:", OUTPUT_JSON)
+
+from google.colab import files
+files.download(OUTPUT_VIDEO)
+files.download(OUTPUT_JSON)
+
